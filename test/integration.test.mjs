@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { appendFile, chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -29,7 +29,17 @@ const spawnedChildren = [];
 
 after(async () => {
   for (const child of spawnedChildren) {
-    try { child.kill("SIGKILL"); } catch {}
+    if (child.exitCode !== null || child.signalCode !== null) continue;
+    if (IS_WIN && child.pid) {
+      try {
+        execFileSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+          windowsHide: true,
+          stdio: "ignore",
+          timeout: 3000,
+        });
+      } catch {}
+    }
+    try { child.kill(IS_WIN ? undefined : "SIGKILL"); } catch {}
   }
   await rm(tmpRoot, { recursive: true, force: true });
 });
