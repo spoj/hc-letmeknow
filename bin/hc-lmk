@@ -1,0 +1,213 @@
+#!/usr/bin/env node
+import { execFile, spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
+import {
+  DEFAULT_HC,
+  USAGE,
+  buildEnvExports,
+  buildHcRunArgs,
+  decodeExecOpts,
+  defaultConfigPath,
+  encodeExecOpts,
+  extractExecOpts,
+  hasNewTerminalFlags,
+  killPidCleanly,
+  parseCliArgs,
+  readJsonIfExists,
+} from "../src/core.mjs";
+import { startSidecarAndWait } from "../src/prepare.mjs";
+
+const run = promisify(execFile);
+const BIN_DIR = dirname(fileURLToPath(import.meta.url));
+const HC_LMK_EXEC_PATH = join(BIN_DIR, "hc-lmk-exec");
+
+async function runWrappedInPlace({ encodedOpts, command, terminalId }) {
+  const ready = await startSidecarAndWait({
+    encodedOpts,
+    terminalId,
+    watchPid: process.pid,
+  });
+
+  const childEnv = { ...process.env };
+  for (const [k, v] of buildEnvExports(ready)) {
+    childEnv[k] = v;
+  }
+
+  const [cmd, ...args] = command;
+  const child = spawn(cmd, args, {
+    stdio: "inherit",
+    env: childEnv,
+  });
+
+  const forwardSignal = sig => {
+    try { child.kill(sig); } catch {}
+  };
+  const onSigint = () => {};
+  const onSigterm = () => forwardSignal("SIGTERM");
+  const onSighup = () => forwardSignal("SIGHUP");
+  process.on("SIGINT", onSigint);
+  process.on("SIGTERM", onSigterm);
+  process.on("SIGHUP", onSighup);
+
+  const outcome = await new Promise(resolveOutcome => {
+    child.on("error", err => resolveOutcome({ error: err }));
+    child.on("exit", (code, signal) => resolveOutcome({ code, signal }));
+  });
+
+  process.off("SIGINT", onSigint);
+  process.off("SIGTERM", onSigterm);
+  process.off("SIGHUP", onSighup);
+
+  await killPidCleanly(ready.sidecarPid, 2500);
+
+  if (outcome.error) {
+    console.error(`hc-lmk: failed to run ${cmd}: ${outcome.error.message}`);
+    process.exit(127);
+  }
+  if (outcome.signal) {
+    process.kill(process.pid, outcome.signal);
+    return;
+  }
+  process.exit(outcome.code ?? 1);
+}
+
+async function runInternalExec(argv) {
+  // hc-lmk _exec <encoded-opts> -- <cmd> [args...]
+  const encodedOpts = argv[0];
+  if (!encodedOpts || argv[1] !== "--" || argv.length < 3) {
+    console.error("hc-lmk _exec: usage: hc-lmk _exec <encoded-opts> -- <command> [args...]");
+    process.exit(2);
+  }
+  // Validate encoded opts upfront.
+  decodeExecOpts(encodedOpts);
+  const terminalId = process.env.HC_TERMINAL_ID;
+  await runWrappedInPlace({
+    encodedOpts,
+    command: argv.slice(2),
+    terminalId,
+  });
+}
+
+async function runOuterLaunch(parsed) {
+  const isRemote = Boolean(parsed.on);
+  const configPath = parsed.config || defaultConfigPath();
+  let fileConfig = {};
+  if (!isRemote) {
+    try {
+      fileConfig = readJsonIfExists(configPath);
+    } catch (err) {
+      console.error(`hc-lmk: failed to read config ${configPath}: ${err.message}`);
+      process.exit(1);
+    }
+  }
+  const hcBin = parsed.hc ?? fileConfig.hc ?? DEFAULT_HC;
+  const execOpts = extractExecOpts(parsed, { isRemote });
+  const encodedOpts = encodeExecOpts(execOpts);
+  const execArgv = isRemote
+    ? ["hc-lmk", "_exec", encodedOpts, "--", ...parsed.command]
+    : [HC_LMK_EXEC_PATH, encodedOpts, "--", ...parsed.command];
+  const hcArgs = buildHcRunArgs(parsed, execArgv);
+
+  let stdout;
+  try {
+    ({ stdout } = await run(hcBin, hcArgs, { windowsHide: true }));
+  } catch (err) {
+    if (err.stderr) process.stderr.write(err.stderr);
+    else if (err.stdout) process.stderr.write(err.stdout);
+    else console.error(`hc-lmk: ${err.message}`);
+    process.exit(typeof err.code === "number" ? err.code : 1);
+  }
+
+  let runResult;
+  try {
+    runResult = JSON.parse(stdout);
+  } catch {
+    console.error(`hc-lmk: unexpected non-JSON output from ${hcBin} run: ${stdout.trim()}`);
+    process.exit(1);
+  }
+
+  const address = runResult?.address;
+  if (!address) {
+    console.error(`hc-lmk: ${hcBin} run did not return a terminal address: ${stdout.trim()}`);
+    process.exit(1);
+  }
+
+  const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  if (parsed.bg || parsed.json || !interactive) {
+    if (parsed.json) {
+      process.stdout.write(`${JSON.stringify(runResult)}\n`);
+    } else {
+      process.stdout.write(`${address}\n`);
+    }
+    process.exit(0);
+  }
+
+  const onSigint = () => {};
+  process.on("SIGINT", onSigint);
+  const attach = spawn(hcBin, ["attach", address], { stdio: "inherit" });
+  attach.on("error", err => {
+    process.off("SIGINT", onSigint);
+    console.error(`hc-lmk: failed to attach: ${err.message}`);
+    process.exit(1);
+  });
+  attach.on("exit", (code, signal) => {
+    process.off("SIGINT", onSigint);
+    if (signal) process.kill(process.pid, signal);
+    process.exit(code ?? 0);
+  });
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  if (argv[0] === "_exec") {
+    await runInternalExec(argv.slice(1));
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = parseCliArgs(argv);
+  } catch (err) {
+    console.error(`hc-lmk: ${err.message}`);
+    process.exit(2);
+  }
+
+  if (parsed.help) {
+    process.stdout.write(USAGE);
+    process.exit(0);
+  }
+
+  if (parsed.command.length === 0) {
+    console.error("hc-lmk: missing <command>\n");
+    process.stderr.write(USAGE);
+    process.exit(2);
+  }
+
+  const terminalId = process.env.HC_TERMINAL_ID;
+  const spawnNewTerminal = !terminalId || hasNewTerminalFlags(parsed);
+
+  if (spawnNewTerminal) {
+    await runOuterLaunch(parsed);
+  } else {
+    const execOpts = extractExecOpts(parsed, { isRemote: false });
+    const encodedOpts = encodeExecOpts(execOpts);
+    await runWrappedInPlace({
+      encodedOpts,
+      command: parsed.command,
+      terminalId,
+    });
+  }
+}
+
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+if (isMain) {
+  try {
+    await main();
+  } catch (err) {
+    console.error(`hc-lmk: ${err.message}`);
+    process.exit(1);
+  }
+}

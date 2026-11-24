@@ -1,0 +1,17 @@
+{
+  "name": "hc-letmeknow",
+  "version": "0.1.0",
+  "description": "Harness-agnostic letmeknow wrapper for herdr-core (hc)",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "hc-lmk": "./bin/hc-lmk",
+    "lmk": "./bin/lmk"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

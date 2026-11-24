@@ -1,0 +1,66 @@
+#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+import { isAlive, termStatePath } from "../src/core.mjs";
+
+export function resolveSessionTarget(env = process.env) {
+  let bin = env.LETMEKNOW_BIN || "";
+  let fp = env.LETMEKNOW_SESSION || "";
+  if (bin && fp) {
+    return { bin, fp, source: "env" };
+  }
+
+  const terminalId = env.HC_TERMINAL_ID;
+  if (terminalId) {
+    const file = termStatePath(terminalId);
+    if (existsSync(file)) {
+      let state;
+      try {
+        state = JSON.parse(readFileSync(file, "utf8"));
+      } catch {
+        state = null;
+      }
+      if (state && (state.sidecarPid === undefined || isAlive(state.sidecarPid))) {
+        bin = bin || state.bin || "";
+        fp = fp || state.fp || "";
+        if (bin && fp) {
+          return { bin, fp, source: "state" };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const target = resolveSessionTarget(process.env);
+  if (!target) {
+    const tid = process.env.HC_TERMINAL_ID;
+    console.error(
+      `lmk: no active hc-letmeknow session (LETMEKNOW_SESSION/LETMEKNOW_BIN not set${tid ? ` and no active sidecar state for terminal ${tid}` : ""})`
+    );
+    process.exit(1);
+  }
+
+  const { LETMEKNOW_SESSION: _strip, ...childEnv } = process.env;
+  const child = spawn(target.bin, ["--session", target.fp, ...args], {
+    stdio: "inherit",
+    env: childEnv,
+  });
+
+  child.on("error", err => {
+    console.error(`lmk: failed to run ${target.bin}: ${err.message}`);
+    process.exit(1);
+  });
+  child.on("exit", (code, signal) => {
+    if (signal) process.kill(process.pid, signal);
+    process.exit(code ?? 1);
+  });
+}
+
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+if (isMain) {
+  await main();
+}
