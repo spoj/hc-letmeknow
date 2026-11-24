@@ -743,11 +743,11 @@ test("sidecar --deliver idle uses --if idle, retries on status_mismatch (exit 10
   });
   assert.equal(readyMsg.ok, true);
 
-  // Emit event -> bootFallbackMs (150ms) opens gate -> sends with --if idle -> hits status_mismatch (exit 10)
+  // Emit event -> bootFallbackMs (150ms) opens gate -> sends with --if idle -- t20 -> hits status_mismatch (exit 10)
   await fx.emitLmkEvent({ type: "message", from: "eve", content: "idle-check" });
   await waitFor(async () => (await fx.readHcCalls()).filter(c => c.args[0] === "send").length >= 1, 4000, "idle mismatch send");
   let sends = (await fx.readHcCalls()).filter(c => c.args[0] === "send");
-  assert.deepEqual(sends[0].args.slice(0, 5), ["send", "--json", "--if", "idle", "t20"]);
+  assert.deepEqual(sends[0].args.slice(0, 6), ["send", "--json", "--if", "idle", "--", "t20"]);
 
   // Emit status=idle -> immediately retries and succeeds!
   await fx.emitHcEvent({
@@ -856,6 +856,85 @@ test("sidecar shuts down on hc send exit 3 (not_found) / exit 11 (finished), reu
   assert.notEqual(failRes.code, 0);
   const badReceipt = JSON.parse(await readFile(badReady, "utf8"));
   assert.ok(typeof badReceipt.error === "string" && badReceipt.error.length > 0);
+});
+
+test("sidecar --deliver idle defers during working, delivers on confirmed done without --if idle, and passes -- before dash-prefixed text", async () => {
+  const fx = await createFakeEnv("deliver-idle-done");
+  await fx.setHcControl({
+    terminalState: "live",
+    terminalStatus: "working",
+    sendResponses: ["ok", { code: 10, kind: "status_mismatch", message: "t60 is done, not idle" }, "ok"],
+  });
+
+  const encoded = encodeExecOpts({
+    joinSpecified: true,
+    join: [],
+    attachSpecified: true,
+    attach: "",
+    deliver: "idle",
+    bootFallbackMs: 60_000,
+    hc: fx.fakeHcPath,
+    letmeknowBin: fx.fakeLmkPath,
+    prefix: "-hello",
+  });
+
+  const sidecar = spawn(process.execPath, [SIDECAR, "--opts", encoded, "--terminal", "t60"], {
+    env: {
+      ...process.env,
+      HOME: fx.home,
+      HC_LETMEKNOW_DEBOUNCE_MS: "60",
+      HC_LETMEKNOW_RETRY_MS: "10000",
+    },
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
+  });
+  spawnedChildren.push(sidecar);
+  const ready = await new Promise(resolve => sidecar.once("message", resolve));
+  assert.equal(ready.ok, true);
+
+  // Event arrives while terminal is "working" -> boot gate is open (snapshot status was working),
+  // but --deliver idle MUST defer without calling hc send!
+  await fx.emitLmkEvent({ type: "message", from: "u1", content: "wait-for-done" });
+  await new Promise(r => setTimeout(r, 250));
+  assert.equal((await fx.readHcCalls()).filter(c => c.args[0] === "send").length, 0, "must defer while working");
+
+  // Transition to "done" in hc events while hc get STILL reports "working" -> confirmation guard must keep deferring!
+  await fx.emitHcEvent({
+    jsonrpc: "2.0",
+    method: "event",
+    params: { terminal: "t60", type: "status", data: { status: { state: "done" } } },
+  });
+  await new Promise(r => setTimeout(r, 200));
+  assert.equal((await fx.readHcCalls()).filter(c => c.args[0] === "send").length, 0, "must defer if hc get sees working");
+
+  // Now hc get confirms "done" and hc events transitions working -> done -> delivers WITHOUT --if idle and WITH -- before "-hello ..."!
+  await fx.setHcControl({ terminalStatus: "done" });
+  await fx.emitHcEvent({
+    jsonrpc: "2.0",
+    method: "event",
+    params: { terminal: "t60", type: "status", data: { status: { state: "done" } } },
+  });
+  await waitFor(async () => (await fx.readHcCalls()).filter(c => c.args[0] === "send").length >= 1, 4000, "done delivery");
+  let sends = (await fx.readHcCalls()).filter(c => c.args[0] === "send");
+  assert.deepEqual(sends[0].args.slice(0, 4), ["send", "--json", "--", "t60"]);
+  assert.equal(sends[0].args.includes("--if"), false, "confirmed done must omit --if idle");
+  assert.ok(sends[0].args[4].startsWith("-hello "), "dash-prefixed text safely follows -- separator");
+
+  // Self-heal when hc events reported "idle" but terminal transitioned to "done" before hc send --if idle arrived:
+  // send #2 hits exit 10 (status_mismatch), sidecar checks hc get -> sees "done" -> immediately retries send #3 without --if idle!
+  await fx.emitHcEvent({
+    jsonrpc: "2.0",
+    method: "event",
+    params: { terminal: "t60", type: "status", data: { status: { state: "idle" } } },
+  });
+  await new Promise(r => setTimeout(r, 80));
+  await fx.emitLmkEvent({ type: "message", from: "u2", content: "lagged-done" });
+  await waitFor(async () => (await fx.readHcCalls()).filter(c => c.args[0] === "send").length >= 3, 4000, "status_mismatch done self-heal");
+  sends = (await fx.readHcCalls()).filter(c => c.args[0] === "send");
+  assert.deepEqual(sends[1].args.slice(0, 6), ["send", "--json", "--if", "idle", "--", "t60"]);
+  assert.deepEqual(sends[2].args.slice(0, 4), ["send", "--json", "--", "t60"]);
+
+  sidecar.kill("SIGTERM");
+  await new Promise(resolve => sidecar.once("exit", resolve));
 });
 
 test("sidecar start priority: --session -> --key -> attach -> fresh listen with fallbacks", async () => {

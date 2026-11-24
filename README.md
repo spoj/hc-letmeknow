@@ -42,7 +42,7 @@ hc-lmk --bg --json --name worker --join <group> -- agy --dangerously-skip-permis
 - `--session <fp>`: resume a saved session fingerprint
 - `--key <name>`: persist and resume session fingerprint in `~/.local/state/hc-letmeknow/sessions.json`
 - `--ready-file <path>`: atomic JSON `{ fp, groups, warnings }` or `{ error }` written after group join
-- `--deliver <always|idle>`: delivery mode (default: `always`; `idle` adds `--if idle` to `hc send`)
+- `--deliver <always|idle>`: delivery mode (default: `always`; `idle` defers while `working`/`blocked` and delivers on `idle` via `--if idle` or confirmed `done`)
 - `--inline-bytes <n>`: max UTF-8 bytes for single-event inline delivery (default: `1536`)
 - `--boot-fallback-ms <n>`: boot gate fallback for non-OSC-7501 programs (default: `5000`)
 - `--config <path>`: config file path (default: `~/.config/hc-letmeknow/config.json`)

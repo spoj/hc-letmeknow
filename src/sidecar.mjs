@@ -113,6 +113,7 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
 
   let bootReady = false;
   let terminalStatus = null;
+  let statusEpoch = 0;
   let deliveredFirst = false;
   let inboxSeq = 0;
   let inboxSeqInitPromise;
@@ -240,11 +241,64 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
     retryTimer = undefined;
   };
 
+  const isIdleReady = state => state === "idle" || state === "done";
+
+  const queryTerminal = async () => {
+    try {
+      const { stdout } = await run(cfg.hcBin, ["get", "--json", terminalId], {
+        env: childEnv,
+        timeout: 10_000,
+        windowsHide: true,
+      });
+      const info = JSON.parse(stdout);
+      if (info?.state === "finished") {
+        void shutdown(0);
+        return { alive: false, status: null };
+      }
+      return { alive: true, status: info?.status?.state ?? null };
+    } catch (err) {
+      const kind = classifyHcError(err);
+      if (kind === "not_found" || kind === "finished") {
+        void shutdown(0);
+        return { alive: false, status: null };
+      }
+      return { alive: true, status: undefined };
+    }
+  };
+
   const attemptDelivery = async () => {
     if (shuttingDown || delivering || !bootReady || pendingLines.length === 0) return;
     delivering = true;
     clearRetryTimer();
+    const deferRetry = () => {
+      retryAttempts += 1;
+      const delay = Math.min(retryMaxMs, retryBaseMs * Math.min(retryAttempts, 3));
+      scheduleRetry(delay);
+    };
     try {
+      let useIfIdle = cfg.deliver === "idle";
+      if (cfg.deliver === "idle") {
+        if (terminalStatus === "working" || terminalStatus === "blocked") {
+          deferRetry();
+          return;
+        }
+        if (terminalStatus === "done") {
+          const epochBefore = statusEpoch;
+          const live = await queryTerminal();
+          if (!live.alive || shuttingDown) return;
+          if (statusEpoch === epochBefore && live.status !== undefined) {
+            terminalStatus = live.status;
+          }
+          if (terminalStatus === "working" || terminalStatus === "blocked") {
+            deferRetry();
+            return;
+          }
+          if (terminalStatus === "done") {
+            useIfIdle = false;
+          }
+        }
+      }
+
       const snapshotLen = pendingLines.length;
       const version = pendingVersion;
       let payload;
@@ -257,10 +311,10 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
       }
 
       const sendArgs = ["send", "--json"];
-      if (cfg.deliver === "idle") {
+      if (useIfIdle) {
         sendArgs.push("--if", "idle");
       }
-      sendArgs.push(terminalId, payload.text);
+      sendArgs.push("--", terminalId, payload.text);
 
       try {
         await run(cfg.hcBin, sendArgs, {
@@ -280,9 +334,19 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
           void shutdown(0);
           return;
         }
-        retryAttempts += 1;
-        const delay = Math.min(retryMaxMs, retryBaseMs * Math.min(retryAttempts, 3));
-        scheduleRetry(delay);
+        if (kind === "status_mismatch" && useIfIdle) {
+          const epochBefore = statusEpoch;
+          const live = await queryTerminal();
+          if (!live.alive || shuttingDown) return;
+          if (statusEpoch === epochBefore && live.status !== undefined) {
+            terminalStatus = live.status;
+          }
+          if (terminalStatus === "done") {
+            // Re-enter immediately in finally with confirmed "done" status (omitting --if idle).
+            return;
+          }
+        }
+        deferRetry();
       }
     } finally {
       delivering = false;
@@ -336,6 +400,7 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
   const onTerminalStatus = (state) => {
     const prev = terminalStatus;
     terminalStatus = state ?? null;
+    statusEpoch += 1;
     if (!bootReady && (terminalStatus === "idle" || terminalStatus === "done" || terminalStatus === "working")) {
       openBootGate();
       return;
@@ -343,7 +408,7 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
     if (!bootReady || pendingLines.length === 0 || delivering) return;
     if (terminalStatus === prev) return;
     if (cfg.deliver === "idle") {
-      if (terminalStatus === "idle") {
+      if (isIdleReady(terminalStatus)) {
         clearRetryTimer();
         void attemptDelivery();
       }
@@ -354,29 +419,12 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
   };
 
   const checkTerminalAlive = async () => {
-    try {
-      const { stdout } = await run(cfg.hcBin, ["get", "--json", terminalId], {
-        env: childEnv,
-        timeout: 10_000,
-        windowsHide: true,
-      });
-      const info = JSON.parse(stdout);
-      if (info?.state === "finished") {
-        void shutdown(0);
-        return false;
-      }
-      if (info?.status?.state !== undefined) {
-        onTerminalStatus(info.status.state);
-      }
-      return true;
-    } catch (err) {
-      const kind = classifyHcError(err);
-      if (kind === "not_found" || kind === "finished") {
-        void shutdown(0);
-        return false;
-      }
-      return true;
+    const live = await queryTerminal();
+    if (!live.alive) return false;
+    if (live.status !== undefined) {
+      onTerminalStatus(live.status);
     }
+    return true;
   };
 
   const handleEventLine = (line) => {
