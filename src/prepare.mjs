@@ -2,11 +2,13 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
   decodeExecOpts,
   formatShellEnvFile,
+  isMainModule,
+  killChildCleanly,
+  killPidCleanly,
   safePathSegment,
   stateDir,
   writeFileAtomic,
@@ -17,7 +19,7 @@ const SRC_DIR = dirname(fileURLToPath(import.meta.url));
 const SIDECAR_PATH = join(SRC_DIR, "sidecar.mjs");
 const STARTUP_TIMEOUT_MS = Number(process.env.HC_LETMEKNOW_STARTUP_TIMEOUT_MS) || 45_000;
 
-export async function startSidecarAndWait({ encodedOpts, terminalId, watchPid, env = process.env }) {
+export async function startSidecarAndWait({ encodedOpts, terminalId, watchPid, keepIpc = false, env = process.env }) {
   if (!terminalId) {
     throw new Error("HC_TERMINAL_ID is not set (must run inside an hc terminal)");
   }
@@ -34,6 +36,9 @@ export async function startSidecarAndWait({ encodedOpts, terminalId, watchPid, e
   const sidecarArgs = [SIDECAR_PATH, "--opts", encodedOpts, "--terminal", terminalId, "--err-log", errLogPath];
   if (watchPid && Number.isInteger(Number(watchPid)) && Number(watchPid) > 0) {
     sidecarArgs.push("--watch-pid", String(watchPid));
+  }
+  if (keepIpc) {
+    sidecarArgs.push("--keep-ipc");
   }
 
   let child;
@@ -70,7 +75,9 @@ export async function startSidecarAndWait({ encodedOpts, terminalId, watchPid, e
       };
 
       const timer = setTimeout(() => {
-        try { child.kill("SIGTERM"); } catch {}
+        try {
+          child.kill(process.platform === "win32" ? undefined : "SIGTERM");
+        } catch {}
         finish(rejectReady, new Error(`timed out waiting for letmeknow sidecar ready (${STARTUP_TIMEOUT_MS}ms)`));
       }, STARTUP_TIMEOUT_MS);
 
@@ -89,6 +96,30 @@ export async function startSidecarAndWait({ encodedOpts, terminalId, watchPid, e
         finish(rejectReady, new Error(`sidecar exited early (${signal || `code ${code}`})${detail}`));
       });
     });
+
+    if (keepIpc) {
+      child.unref();
+      const stop = async (graceMs = 2500) => {
+        if (child.exitCode !== null || child.signalCode !== null) return;
+        const exited = new Promise(resolveExit => child.once("exit", resolveExit));
+        if (child.connected) {
+          try {
+            child.send({ type: "shutdown" });
+          } catch {}
+          const done = await Promise.race([
+            exited.then(() => true),
+            new Promise(r => setTimeout(() => r(false), graceMs)),
+          ]);
+          if (done) return;
+        }
+        try {
+          if (child.connected) child.disconnect();
+        } catch {}
+        await killChildCleanly(child, 1000);
+        await killPidCleanly(ready.sidecarPid, 1000);
+      };
+      return { ...ready, stop };
+    }
 
     if (child.connected) {
       child.disconnect();
@@ -132,8 +163,7 @@ async function main() {
   process.stdout.write(`${envFilePath}\n`);
 }
 
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
-if (isMain) {
+if (isMainModule(import.meta.url, process.argv[1])) {
   try {
     await main();
   } catch (err) {

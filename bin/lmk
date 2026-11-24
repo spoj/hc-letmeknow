@@ -1,8 +1,6 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { pathToFileURL } from "node:url";
-import { isAlive, termStatePath } from "../src/core.mjs";
+import { existsSync, readFileSync } from "node:fs";
+import { isAlive, isMainModule, spawnCommand, stripEnvVar, termStatePath } from "../src/core.mjs";
 
 export function resolveSessionTarget(env = process.env) {
   let bin = env.LETMEKNOW_BIN || "";
@@ -44,23 +42,30 @@ async function main() {
     process.exit(1);
   }
 
-  const { LETMEKNOW_SESSION: _strip, ...childEnv } = process.env;
-  const child = spawn(target.bin, ["--session", target.fp, ...args], {
+  const childEnv = stripEnvVar(process.env, "LETMEKNOW_SESSION");
+  const onSigint = () => {};
+  process.on("SIGINT", onSigint);
+  const child = spawnCommand(target.bin, ["--session", target.fp, ...args], {
     stdio: "inherit",
     env: childEnv,
+    windowsHide: false,
   });
 
   child.on("error", err => {
+    process.off("SIGINT", onSigint);
     console.error(`lmk: failed to run ${target.bin}: ${err.message}`);
     process.exit(1);
   });
   child.on("exit", (code, signal) => {
-    if (signal) process.kill(process.pid, signal);
+    process.off("SIGINT", onSigint);
+    if (signal && process.platform !== "win32") {
+      process.kill(process.pid, signal);
+      return;
+    }
     process.exit(code ?? 1);
   });
 }
 
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
-if (isMain) {
+if (isMainModule(import.meta.url, process.argv[1])) {
   await main();
 }

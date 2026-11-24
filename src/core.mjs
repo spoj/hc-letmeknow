@@ -1,10 +1,11 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { access, chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, win32 as win32Path } from "node:path";
 import { createInterface } from "node:readline";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 export const MINOR = "0.26";
@@ -71,12 +72,73 @@ export function isAlive(pid) {
   }
 }
 
+export function isMainModule(metaUrl, argv1, platform = process.platform) {
+  if (!metaUrl || !argv1) return false;
+  try {
+    const a = pathToFileURL(realpathSync(fileURLToPath(metaUrl))).href;
+    const b = pathToFileURL(realpathSync(argv1)).href;
+    return platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+  } catch {
+    return false;
+  }
+}
+
+export function stripEnvVar(env = process.env, name, platform = process.platform) {
+  const out = {};
+  const target = platform === "win32" ? String(name).toLowerCase() : String(name);
+  for (const [k, v] of Object.entries(env)) {
+    const cmp = platform === "win32" ? k.toLowerCase() : k;
+    if (cmp === target) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+export function getEnvCaseInsensitive(env = process.env, name) {
+  if (!env || !name) return undefined;
+  if (Object.prototype.hasOwnProperty.call(env, name)) return env[name];
+  const lower = String(name).toLowerCase();
+  for (const [k, v] of Object.entries(env)) {
+    if (k.toLowerCase() === lower) return v;
+  }
+  return undefined;
+}
+
+const WIN_RETRYABLE_RENAME_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+export async function renameWithRetry(
+  src,
+  dst,
+  { platform = process.platform, renameFn = rename, retries = 5, baseDelayMs = 30 } = {}
+) {
+  const maxAttempts = platform === "win32" ? Math.max(1, retries) : 1;
+  let lastErr;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      await renameFn(src, dst);
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (attempt + 1 >= maxAttempts || !WIN_RETRYABLE_RENAME_CODES.has(err?.code)) {
+        throw err;
+      }
+      await new Promise(r => setTimeout(r, baseDelayMs * (attempt + 1)));
+    }
+  }
+  throw lastErr;
+}
+
 export async function writeFileAtomic(filePath, content, mode = 0o600) {
   await mkdir(dirname(filePath), { recursive: true, mode: 0o700 });
   const tmp = `${filePath}.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}.tmp`;
-  await writeFile(tmp, content, { mode });
-  await chmod(tmp, mode).catch(() => {});
-  await rename(tmp, filePath);
+  try {
+    await writeFile(tmp, content, { mode });
+    await chmod(tmp, mode).catch(() => {});
+    await renameWithRetry(tmp, filePath);
+  } catch (err) {
+    await rm(tmp, { force: true }).catch(() => {});
+    throw err;
+  }
 }
 
 export async function writeJsonAtomic(filePath, payload) {
@@ -395,6 +457,148 @@ export function buildHcRunArgs(parsed, execArgv) {
   return args;
 }
 
+export function buildExecArgv({
+  isRemote = false,
+  platform = process.platform,
+  nodePath = process.execPath,
+  hcLmkPath,
+  hcLmkExecPath,
+  encodedOpts,
+  command,
+}) {
+  if (isRemote) {
+    return ["hc-lmk", "_exec", encodedOpts, "--", ...command];
+  }
+  if (platform === "win32") {
+    return [nodePath, hcLmkPath, "_exec", encodedOpts, "--", ...command];
+  }
+  return [hcLmkExecPath, encodedOpts, "--", ...command];
+}
+
+const WIN_CMD_META_RE = /([()\][%!^"`<>&|;, *?])/g;
+
+export function isWinBatchFile(filePath) {
+  return /\.(?:cmd|bat)$/i.test(String(filePath ?? ""));
+}
+
+export function escapeWinCmdCommand(cmd) {
+  return String(cmd).replace(WIN_CMD_META_RE, "^$1");
+}
+
+export function escapeWinCmdArg(arg, doubleEscape = true) {
+  let s = String(arg);
+  s = s.replace(/(?=(\\+?)?)\1"/g, '$1$1\\"');
+  s = s.replace(/(?=(\\+?)?)\1$/, "$1$1");
+  s = `"${s}"`;
+  s = s.replace(WIN_CMD_META_RE, "^$1");
+  if (doubleEscape) {
+    s = s.replace(WIN_CMD_META_RE, "^$1");
+  }
+  return s;
+}
+
+const WIN_EXEC_EXTS = new Set([".com", ".exe", ".bat", ".cmd"]);
+
+export function resolveWinCommand(
+  cmd,
+  env = process.env,
+  { platform = process.platform, isFile } = {}
+) {
+  if (platform !== "win32") {
+    return { file: cmd, isBatch: false };
+  }
+  const checkFile = isFile ?? (p => {
+    try {
+      return statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  });
+  const rawPathext = getEnvCaseInsensitive(env, "PATHEXT") || ".COM;.EXE;.BAT;.CMD";
+  const parsedExts = rawPathext
+    .split(";")
+    .map(s => s.trim().toLowerCase())
+    .filter(s => WIN_EXEC_EXTS.has(s));
+  const exts = parsedExts.length ? parsedExts : [".com", ".exe", ".bat", ".cmd"];
+
+  const lowerCmd = String(cmd).toLowerCase();
+  const hasPathExt = exts.some(ext => lowerCmd.endsWith(ext));
+
+  const tryBase = base => {
+    if (hasPathExt && checkFile(base)) {
+      return { file: base, isBatch: isWinBatchFile(base) };
+    }
+    for (const ext of exts) {
+      const candidate = `${base}${ext}`;
+      if (checkFile(candidate)) {
+        return { file: candidate, isBatch: isWinBatchFile(candidate) };
+      }
+    }
+    return null;
+  };
+
+  if (/[\\/:]/.test(cmd)) {
+    return tryBase(cmd) ?? { file: cmd, isBatch: isWinBatchFile(cmd) };
+  }
+
+  const rawPath = getEnvCaseInsensitive(env, "PATH") || "";
+  const dirs = rawPath
+    .split(";")
+    .map(d => d.trim().replace(/^"+|"+$/g, ""))
+    .filter(Boolean);
+  for (const dir of dirs) {
+    const found = tryBase(win32Path.join(dir, cmd));
+    if (found) return found;
+  }
+
+  return { file: cmd, isBatch: isWinBatchFile(cmd) };
+}
+
+export function buildWinCmdInvocation(resolvedFile, args = [], env = process.env) {
+  const comspec = getEnvCaseInsensitive(env, "ComSpec") || "cmd.exe";
+  const shellCommand = [
+    escapeWinCmdCommand(resolvedFile),
+    ...args.map(a => escapeWinCmdArg(a, true)),
+  ].join(" ");
+  return {
+    file: comspec,
+    args: ["/d", "/s", "/c", `"${shellCommand}"`],
+    windowsVerbatimArguments: true,
+  };
+}
+
+export function prepareSpawnSpec(cmd, args = [], options = {}, platform = process.platform, isFile) {
+  const env = options.env ?? process.env;
+  const resolved = resolveWinCommand(cmd, env, { platform, isFile });
+  if (platform === "win32" && resolved.isBatch) {
+    const inv = buildWinCmdInvocation(resolved.file, args, env);
+    return {
+      file: inv.file,
+      args: inv.args,
+      options: { ...options, windowsVerbatimArguments: true },
+      viaCmd: true,
+    };
+  }
+  return {
+    file: resolved.file,
+    args,
+    options,
+    viaCmd: false,
+  };
+}
+
+export function spawnCommand(cmd, args = [], options = {}) {
+  const spec = prepareSpawnSpec(cmd, args, options);
+  const child = spawn(spec.file, spec.args, spec.options);
+  child._viaCmd = spec.viaCmd;
+  return child;
+}
+
+export async function execFileCommand(cmd, args = [], options = {}) {
+  const spec = prepareSpawnSpec(cmd, args, options);
+  return run(spec.file, spec.args, spec.options);
+}
+
 export function resolveSidecarConfig(execOpts, fileConfig = {}) {
   const groups = execOpts.joinSpecified
     ? (Array.isArray(execOpts.join) ? execOpts.join.filter(Boolean) : [])
@@ -569,10 +773,10 @@ export async function installBinary(warn = () => {}) {
   const tmp = await mkdtemp(join(primaryCache, "new-"));
   try {
     await writeFile(join(tmp, "package.tgz"), bytes);
-    await run("tar", ["-xzf", "package.tgz"], { cwd: tmp, windowsHide: true });
+    await execFileCommand("tar", ["-xzf", "package.tgz"], { cwd: tmp, windowsHide: true });
     await access(join(tmp, "package", "bin", EXECUTABLE));
     try {
-      await rename(join(tmp, "package"), dest);
+      await renameWithRetry(join(tmp, "package"), dest);
     } catch (error) {
       if (!existsSync(executable)) throw error;
     }
@@ -582,12 +786,29 @@ export async function installBinary(warn = () => {}) {
   return executable;
 }
 
+async function taskkillTreeWin(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  try {
+    await run("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, timeout: 3000 });
+  } catch {}
+}
+
 export async function killChildCleanly(child, graceMs = 2000) {
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
   const exited = new Promise(resolveExit => child.once("exit", resolveExit));
   if (process.platform === "win32") {
+    if (child._viaCmd && child.pid) {
+      await taskkillTreeWin(child.pid);
+    }
     try { child.kill(); } catch {}
-    await Promise.race([exited, new Promise(r => setTimeout(r, graceMs))]);
+    const done = await Promise.race([
+      exited.then(() => true),
+      new Promise(r => setTimeout(() => r(false), graceMs)),
+    ]);
+    if (!done && child.exitCode === null && child.signalCode === null && child.pid) {
+      await taskkillTreeWin(child.pid);
+      await Promise.race([exited, new Promise(r => setTimeout(r, 500))]);
+    }
     return;
   }
   try { child.kill("SIGTERM"); } catch {}
@@ -612,8 +833,12 @@ export async function killPidCleanly(pid, graceMs = 2500) {
   while (Date.now() < deadline && isAlive(pid)) {
     await new Promise(r => setTimeout(r, 40));
   }
-  if (isAlive(pid) && process.platform !== "win32") {
-    try { process.kill(pid, "SIGKILL"); } catch {}
+  if (isAlive(pid)) {
+    if (process.platform === "win32") {
+      await taskkillTreeWin(pid);
+    } else {
+      try { process.kill(pid, "SIGKILL"); } catch {}
+    }
     const killDeadline = Date.now() + 1000;
     while (Date.now() < killDeadline && isAlive(pid)) {
       await new Promise(r => setTimeout(r, 40));
@@ -622,7 +847,7 @@ export async function killPidCleanly(pid, graceMs = 2500) {
 }
 
 export async function lmkJson(executable, args, env, timeout = 0) {
-  return JSON.parse((await run(executable, args, { env, timeout, windowsHide: true })).stdout);
+  return JSON.parse((await execFileCommand(executable, args, { env, timeout, windowsHide: true })).stdout);
 }
 
 async function inviteFrom(executable, sibling, group, use, signal, env, inviteWaitMs = INVITE_WAIT_MS) {
@@ -632,7 +857,7 @@ async function inviteFrom(executable, sibling, group, use, signal, env, inviteWa
     await use(await invite());
     return;
   }
-  const listen = spawn(executable, ["--session", sibling.fp, "listen"], {
+  const listen = spawnCommand(executable, ["--session", sibling.fp, "listen"], {
     stdio: ["ignore", "pipe", "pipe"],
     signal,
     env,

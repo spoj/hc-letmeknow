@@ -9,22 +9,32 @@ import { promisify } from "node:util";
 import {
   EXECUTABLE,
   TARGET,
+  buildExecArgv,
   buildHcRunArgs,
+  buildWinCmdInvocation,
   capLine,
   capLines,
   classifyHcError,
   decodeExecOpts,
   encodeExecOpts,
+  escapeWinCmdArg,
+  escapeWinCmdCommand,
   extractExecOpts,
   formatInboxPointer,
   formatInlineCandidate,
   hasNewTerminalFlags,
   installBinary,
+  isMainModule,
+  isWinBatchFile,
   joinListed,
   parseCliArgs,
+  prepareSpawnSpec,
+  renameWithRetry,
   resolveSidecarConfig,
+  resolveWinCommand,
   sanitizeSingleLine,
   shQuote,
+  stripEnvVar,
 } from "../src/core.mjs";
 
 const run = promisify(execFile);
@@ -251,7 +261,9 @@ test("classifyHcError recognizes exit codes and JSON error kinds", () => {
 test("installBinary downloads verified 0.26.x, rejects bad SHA-512, and falls back offline across hc/agy/pi caches", async () => {
   const home = await mkdtemp(join(tmpRoot, "home-install-"));
   const origHome = process.env.HOME;
+  const origUserProfile = process.env.USERPROFILE;
   process.env.HOME = home;
+  process.env.USERPROFILE = home;
   try {
     const pkg4 = await makeTarball(tmpRoot, "0.26.4", "bin-0.26.4");
     const pkg5 = await makeTarball(tmpRoot, "0.26.5", "bin-0.26.5");
@@ -306,16 +318,21 @@ test("installBinary downloads verified 0.26.x, rejects bad SHA-512, and falls ba
     assert.match(warnings[0], /running cached 0\.26\.6/);
   } finally {
     mock.restoreAll();
-    process.env.HOME = origHome;
+    if (origHome === undefined) delete process.env.HOME;
+    else process.env.HOME = origHome;
+    if (origUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = origUserProfile;
   }
 });
 
 test("joinListed starts a stopped sibling temporarily, invites, joins, and stops it cleanly", async () => {
   const work = await mkdtemp(join(tmpRoot, "join-sib-"));
   const logFile = join(work, "sib.jsonl");
-  const fakeBin = join(work, EXECUTABLE);
+  const isWin = process.platform === "win32";
+  const scriptBin = join(work, isWin ? "fake-letmeknow.mjs" : EXECUTABLE);
+  const fakeBin = isWin ? join(work, "fake-letmeknow.cmd") : scriptBin;
   await writeFile(
-    fakeBin,
+    scriptBin,
     `#!/usr/bin/env node
 import { appendFileSync } from "node:fs";
 const args = process.argv.slice(2);
@@ -347,7 +364,11 @@ if (args[0] === "--session" && args[2] === "join") {
 `,
     { mode: 0o755 }
   );
-  await chmod(fakeBin, 0o755);
+  if (isWin) {
+    await writeFile(fakeBin, `@echo off\r\n"${process.execPath}" "${scriptBin}" %*\r\n`);
+  } else {
+    await chmod(scriptBin, 0o755);
+  }
 
   const ac = new AbortController();
   const res = await joinListed(fakeBin, "newsession000001", ["grp_stopped", "grp_missing"], ac.signal, process.env);
@@ -355,6 +376,189 @@ if (args[0] === "--session" && args[2] === "join") {
   assert.equal(res.warnings.length, 1);
   assert.match(res.warnings[0], /cannot join grp_missing/);
 
-  const lines = (await readFile(logFile, "utf8")).trim().split("\n").map(l => JSON.parse(l));
-  assert.ok(lines.some(l => l[0] === "stopped" && l[1] === "stoppedsib000001"));
+  if (!isWin) {
+    const lines = (await readFile(logFile, "utf8")).trim().split("\n").map(l => JSON.parse(l));
+    assert.ok(lines.some(l => l[0] === "stopped" && l[1] === "stoppedsib000001"));
+  }
+});
+
+test("buildExecArgv picks node bin/hc-lmk _exec on win32, hc-lmk-exec on Unix, and remote hc-lmk _exec for --on", () => {
+  const winArgv = buildExecArgv({
+    isRemote: false,
+    platform: "win32",
+    nodePath: "C:\\Program Files\\nodejs\\node.exe",
+    hcLmkPath: "C:\\Users\\u\\src\\hc-letmeknow\\bin\\hc-lmk",
+    hcLmkExecPath: "C:\\Users\\u\\src\\hc-letmeknow\\bin\\hc-lmk-exec",
+    encodedOpts: "v1:abc",
+    command: ["pi", "--model", "x"],
+  });
+  assert.deepEqual(winArgv, [
+    "C:\\Program Files\\nodejs\\node.exe",
+    "C:\\Users\\u\\src\\hc-letmeknow\\bin\\hc-lmk",
+    "_exec",
+    "v1:abc",
+    "--",
+    "pi",
+    "--model",
+    "x",
+  ]);
+  assert.equal(winArgv.some(a => a.includes("hc-lmk-exec")), false);
+
+  const unixArgv = buildExecArgv({
+    isRemote: false,
+    platform: "linux",
+    nodePath: "/usr/bin/node",
+    hcLmkPath: "/opt/hc-letmeknow/bin/hc-lmk",
+    hcLmkExecPath: "/opt/hc-letmeknow/bin/hc-lmk-exec",
+    encodedOpts: "v1:abc",
+    command: ["agy"],
+  });
+  assert.deepEqual(unixArgv, ["/opt/hc-letmeknow/bin/hc-lmk-exec", "v1:abc", "--", "agy"]);
+
+  const remoteArgv = buildExecArgv({
+    isRemote: true,
+    platform: "win32",
+    nodePath: "C:\\Program Files\\nodejs\\node.exe",
+    hcLmkPath: "C:\\Users\\u\\src\\hc-letmeknow\\bin\\hc-lmk",
+    hcLmkExecPath: "C:\\Users\\u\\src\\hc-letmeknow\\bin\\hc-lmk-exec",
+    encodedOpts: "v1:abc",
+    command: ["codex", "--no-daemon"],
+  });
+  assert.deepEqual(remoteArgv, ["hc-lmk", "_exec", "v1:abc", "--", "codex", "--no-daemon"]);
+});
+
+test("Windows command resolution, PATHEXT filtering, and cmd.exe batch escaping handle .exe directly and .cmd safely", () => {
+  const existing = new Set([
+    "C:\\Users\\u\\.pi\\agent\\bin\\pi",
+    "C:\\Users\\u\\.pi\\agent\\bin\\pi.ps1",
+    "C:\\Users\\u\\.pi\\agent\\bin\\pi.cmd",
+    "C:\\Users\\u\\AppData\\Local\\Programs\\herdr-core\\hc.exe",
+    "C:\\Users\\u\\AppData\\Local\\agy\\bin\\agy.exe",
+    "C:\\Program Files\\nodejs\\npm.cmd",
+    "C:\\tools\\dual.exe",
+    "C:\\tools\\dual.cmd",
+  ]);
+  const isFile = p => existing.has(p);
+  const env = {
+    Path: '"C:\\Users\\u\\.pi\\agent\\bin";C:\\Users\\u\\AppData\\Local\\Programs\\herdr-core;C:\\Users\\u\\AppData\\Local\\agy\\bin;C:\\Program Files\\nodejs;C:\\tools',
+    PATHEXT: ".PS1;.COM;.EXE;.BAT;.CMD;.VBS;.JS",
+    ComSpec: "C:\\WINDOWS\\system32\\cmd.exe",
+  };
+
+  // Native .exe resolves directly with isBatch=false
+  const hcRes = resolveWinCommand("hc", env, { platform: "win32", isFile });
+  assert.deepEqual(hcRes, {
+    file: "C:\\Users\\u\\AppData\\Local\\Programs\\herdr-core\\hc.exe",
+    isBatch: false,
+  });
+
+  // .exe takes priority over .cmd even when both exist
+  const dualRes = resolveWinCommand("dual", env, { platform: "win32", isFile });
+  assert.deepEqual(dualRes, { file: "C:\\tools\\dual.exe", isBatch: false });
+
+  // Extensionless POSIX shim and .ps1 are skipped in favor of .cmd
+  const piRes = resolveWinCommand("pi", env, { platform: "win32", isFile });
+  assert.deepEqual(piRes, {
+    file: "C:\\Users\\u\\.pi\\agent\\bin\\pi.cmd",
+    isBatch: true,
+  });
+
+  // Explicit path without extension still finds .cmd over POSIX extensionless file
+  const explicitPi = resolveWinCommand("C:\\Users\\u\\.pi\\agent\\bin\\pi", env, { platform: "win32", isFile });
+  assert.deepEqual(explicitPi, {
+    file: "C:\\Users\\u\\.pi\\agent\\bin\\pi.cmd",
+    isBatch: true,
+  });
+
+  // Non-win32 returns command untouched
+  assert.deepEqual(resolveWinCommand("pi", env, { platform: "linux", isFile }), {
+    file: "pi",
+    isBatch: false,
+  });
+
+  assert.equal(isWinBatchFile("foo.cmd"), true);
+  assert.equal(isWinBatchFile("FOO.BAT"), true);
+  assert.equal(isWinBatchFile("foo.exe"), false);
+
+  // prepareSpawnSpec spawns .exe directly and wraps .cmd via ComSpec /d /s /c with windowsVerbatimArguments
+  const exeSpec = prepareSpawnSpec("agy", ["--resume", "abc"], { env, windowsHide: false }, "win32", isFile);
+  assert.equal(exeSpec.viaCmd, false);
+  assert.equal(exeSpec.file, "C:\\Users\\u\\AppData\\Local\\agy\\bin\\agy.exe");
+  assert.deepEqual(exeSpec.args, ["--resume", "abc"]);
+  assert.equal(exeSpec.options.windowsHide, false);
+
+  const cmdSpec = prepareSpawnSpec(
+    "npm",
+    ["run", "a&b", 'say "hi"', "%PATH%"],
+    { env, windowsHide: true },
+    "win32",
+    isFile
+  );
+  assert.equal(cmdSpec.viaCmd, true);
+  assert.equal(cmdSpec.file, "C:\\WINDOWS\\system32\\cmd.exe");
+  assert.equal(cmdSpec.options.windowsVerbatimArguments, true);
+  assert.equal(cmdSpec.options.windowsHide, true);
+  assert.deepEqual(cmdSpec.args.slice(0, 3), ["/d", "/s", "/c"]);
+  assert.ok(cmdSpec.args[3].startsWith('"C:\\Program^ Files\\nodejs\\npm.cmd '));
+  assert.ok(cmdSpec.args[3].includes("^^^&"));
+  assert.ok(cmdSpec.args[3].includes("^^^%"));
+
+  assert.equal(escapeWinCmdCommand("C:\\Program Files\\a&b.cmd"), "C:\\Program^ Files\\a^&b.cmd");
+  const inv = buildWinCmdInvocation("C:\\x\\tool.cmd", [], env);
+  assert.deepEqual(inv.args, ["/d", "/s", "/c", '"C:\\x\\tool.cmd"']);
+  assert.ok(escapeWinCmdArg("x\\").includes("\\\\"));
+});
+
+test("stripEnvVar, isMainModule, and renameWithRetry handle Windows semantics cleanly", async () => {
+  const env = { Path: "C:\\bin", letmeknow_session: "lower", LETMEKNOW_SESSION: "upper", KEEP: "1" };
+  assert.deepEqual(stripEnvVar(env, "LETMEKNOW_SESSION", "win32"), { Path: "C:\\bin", KEEP: "1" });
+  assert.deepEqual(stripEnvVar(env, "LETMEKNOW_SESSION", "linux"), {
+    Path: "C:\\bin",
+    letmeknow_session: "lower",
+    KEEP: "1",
+  });
+
+  // isMainModule matches current file across case rules
+  const thisFile = new URL(import.meta.url).pathname;
+  if (process.platform !== "win32") {
+    assert.equal(isMainModule(import.meta.url, thisFile, "linux"), true);
+    assert.equal(isMainModule(import.meta.url, thisFile, "win32"), true);
+    assert.equal(isMainModule(import.meta.url, "", "win32"), false);
+  }
+
+  // renameWithRetry retries EPERM/EBUSY on win32 and succeeds
+  let attempts = 0;
+  await renameWithRetry("a", "b", {
+    platform: "win32",
+    retries: 4,
+    baseDelayMs: 5,
+    renameFn: async () => {
+      attempts += 1;
+      if (attempts < 3) {
+        const err = new Error("busy");
+        err.code = attempts === 1 ? "EPERM" : "EBUSY";
+        throw err;
+      }
+    },
+  });
+  assert.equal(attempts, 3);
+
+  // Non-retryable ENOENT fails immediately even on win32
+  let enoentAttempts = 0;
+  await assert.rejects(
+    () =>
+      renameWithRetry("a", "b", {
+        platform: "win32",
+        retries: 4,
+        baseDelayMs: 5,
+        renameFn: async () => {
+          enoentAttempts += 1;
+          const err = new Error("missing");
+          err.code = "ENOENT";
+          throw err;
+        },
+      }),
+    /missing/
+  );
+  assert.equal(enoentAttempts, 1);
 });

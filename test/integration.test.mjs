@@ -10,10 +10,19 @@ import { decodeExecOpts, encodeExecOpts, isAlive } from "../src/core.mjs";
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_DIR = dirname(TEST_DIR);
+const IS_WIN = process.platform === "win32";
 const HC_LMK = join(REPO_DIR, "bin", "hc-lmk");
 const HC_LMK_EXEC = join(REPO_DIR, "bin", "hc-lmk-exec");
 const LMK_BIN = join(REPO_DIR, "bin", "lmk");
 const SIDECAR = join(REPO_DIR, "src", "sidecar.mjs");
+
+function homeEnv(home, extra = {}) {
+  return { ...process.env, HOME: home, USERPROFILE: home, ...extra };
+}
+
+function runNodeScript(scriptPath, args, opts = {}) {
+  return runCmd(process.execPath, [scriptPath, ...args], opts);
+}
 
 const tmpRoot = await mkdtemp(join(tmpdir(), "hc-lmk-int-test-"));
 const spawnedChildren = [];
@@ -78,9 +87,10 @@ async function createFakeEnv(name) {
     crashAfterMs: 0,
   }));
 
-  const fakeHcPath = join(work, "fake-hc");
+  const fakeHcScript = join(work, IS_WIN ? "fake-hc.mjs" : "fake-hc");
+  const fakeHcPath = IS_WIN ? join(work, "fake-hc.cmd") : fakeHcScript;
   await writeFile(
-    fakeHcPath,
+    fakeHcScript,
     `#!/usr/bin/env node
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
@@ -167,11 +177,16 @@ if (sub === "events") {
 `,
     { mode: 0o755 }
   );
-  await chmod(fakeHcPath, 0o755);
+  if (IS_WIN) {
+    await writeFile(fakeHcPath, `@echo off\r\n"${process.execPath}" "${fakeHcScript}" %*\r\n`);
+  } else {
+    await chmod(fakeHcScript, 0o755);
+  }
 
-  const fakeLmkPath = join(work, "fake-letmeknow");
+  const fakeLmkScript = join(work, IS_WIN ? "fake-letmeknow.mjs" : "fake-letmeknow");
+  const fakeLmkPath = IS_WIN ? join(work, "fake-letmeknow.cmd") : fakeLmkScript;
   await writeFile(
-    fakeLmkPath,
+    fakeLmkScript,
     `#!/usr/bin/env node
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
@@ -306,7 +321,11 @@ if (cmd === "listen") {
 `,
     { mode: 0o755 }
   );
-  await chmod(fakeLmkPath, 0o755);
+  if (IS_WIN) {
+    await writeFile(fakeLmkPath, `@echo off\r\n"${process.execPath}" "${fakeLmkScript}" %*\r\n`);
+  } else {
+    await chmod(fakeLmkScript, 0o755);
+  }
 
   const readHcCalls = async () => {
     if (!existsSync(hcLogPath)) return [];
@@ -345,13 +364,13 @@ if (cmd === "listen") {
   };
 }
 
-test("outer hc-lmk launches hc run with local hc-lmk-exec, remote _exec, --json/address output, and forwards errors", async () => {
+test("outer hc-lmk launches hc run with local inner exec, remote _exec, --json/address output, and forwards errors", async () => {
   const fx = await createFakeEnv("outer");
-  const baseEnv = { ...process.env, HOME: fx.home };
+  const baseEnv = homeEnv(fx.home);
   delete baseEnv.HC_TERMINAL_ID;
 
   // 1. Local outer launch with --bg --json
-  const r1 = await runCmd(
+  const r1 = await runNodeScript(
     HC_LMK,
     ["--bg", "--json", "--hc", fx.fakeHcPath, "--join", "grp_alpha", "--name", "bot1", "--label", "owner=tg", "codex", "--no-daemon"],
     { env: baseEnv, cwd: fx.work }
@@ -364,18 +383,27 @@ test("outer hc-lmk launches hc run with local hc-lmk-exec, remote _exec, --json/
   const runArgs1 = calls[0].args;
   assert.deepEqual(runArgs1.slice(0, 3), ["run", "--bg", "--json"]);
   const sep = runArgs1.indexOf("--");
-  assert.equal(runArgs1[sep + 1], HC_LMK_EXEC);
-  const decoded1 = decodeExecOpts(runArgs1[sep + 2]);
-  assert.deepEqual(decoded1.join, ["grp_alpha"]);
-  assert.deepEqual(runArgs1.slice(sep + 3), ["--", "codex", "--no-daemon"]);
+  if (IS_WIN) {
+    assert.equal(runArgs1[sep + 1], process.execPath);
+    assert.equal(runArgs1[sep + 2], HC_LMK);
+    assert.equal(runArgs1[sep + 3], "_exec");
+    const decoded1 = decodeExecOpts(runArgs1[sep + 4]);
+    assert.deepEqual(decoded1.join, ["grp_alpha"]);
+    assert.deepEqual(runArgs1.slice(sep + 5), ["--", "codex", "--no-daemon"]);
+  } else {
+    assert.equal(runArgs1[sep + 1], HC_LMK_EXEC);
+    const decoded1 = decodeExecOpts(runArgs1[sep + 2]);
+    assert.deepEqual(decoded1.join, ["grp_alpha"]);
+    assert.deepEqual(runArgs1.slice(sep + 3), ["--", "codex", "--no-daemon"]);
+  }
 
   // 2. Non-TTY without --json prints plain address
-  const r2 = await runCmd(HC_LMK, ["--hc", fx.fakeHcPath, "bash"], { env: baseEnv });
+  const r2 = await runNodeScript(HC_LMK, ["--hc", fx.fakeHcPath, "bash"], { env: baseEnv });
   assert.equal(r2.code, 0, r2.stderr);
   assert.equal(r2.stdout.trim(), "t99");
 
   // 3. Remote --on uses `hc-lmk _exec` instead of local abs path, keeps remote relative --ready-file
-  const r3 = await runCmd(
+  const r3 = await runNodeScript(
     HC_LMK,
     ["--bg", "--on", "vps", "--ready-file", "rel/ready.json", "--hc", fx.fakeHcPath, "pi", "--name", "x"],
     { env: baseEnv }
@@ -390,7 +418,7 @@ test("outer hc-lmk launches hc run with local hc-lmk-exec, remote _exec, --json/
   assert.deepEqual(runArgs3.slice(sep3 + 4), ["--", "pi", "--name", "x"]);
 
   // 4. Inside hc WITH --new spawns new hc run (without passing --new to hc)
-  const r4 = await runCmd(
+  const r4 = await runNodeScript(
     HC_LMK,
     ["--new", "--hc", fx.fakeHcPath, "bash"],
     { env: { ...baseEnv, HC_TERMINAL_ID: "t5" } }
@@ -401,12 +429,12 @@ test("outer hc-lmk launches hc run with local hc-lmk-exec, remote _exec, --json/
 
   // 5. Name collision / hc run failure propagates non-zero exit code + stderr
   await fx.setHcControl({ runExitCode: 6 });
-  const r5 = await runCmd(HC_LMK, ["--bg", "--json", "--name", "dup", "--hc", fx.fakeHcPath, "bash"], { env: baseEnv });
+  const r5 = await runNodeScript(HC_LMK, ["--bg", "--json", "--name", "dup", "--hc", fx.fakeHcPath, "bash"], { env: baseEnv });
   assert.equal(r5.code, 6);
   assert.match(r5.stderr, /name_taken/);
 });
 
-test("hc-lmk-exec performs POSIX exec (same PID), exports env, deletes temp env file, boots concurrently with slow join, and cleans up on exit", async () => {
+test("hc-lmk-exec performs POSIX exec (same PID), exports env, deletes temp env file, boots concurrently with slow join, and cleans up on exit", { skip: IS_WIN }, async () => {
   const fx = await createFakeEnv("posix-exec");
   await fx.setLmkControl({ joinDelayMs: 600 });
 
@@ -569,11 +597,11 @@ test("hc-lmk in-place mode inside hc wraps command, mirrors exit code, and stops
     }));
     process.exit(42);
   `;
-  const res = await runCmd(
+  const res = await runNodeScript(
     HC_LMK,
     ["--no-join", "--hc", fx.fakeHcPath, "--letmeknow-bin", fx.fakeLmkPath, process.execPath, "-e", cmdCode],
     {
-      env: { ...process.env, HOME: fx.home, HC_TERMINAL_ID: "t88" },
+      env: homeEnv(fx.home, { HC_TERMINAL_ID: "t88" }),
     }
   );
   assert.equal(res.code, 42, res.stderr);
@@ -614,12 +642,10 @@ test("sidecar boot gate (OSC 7501), inline vs inbox spill, blocked retry, reconn
   });
 
   const sidecar = spawn(process.execPath, [SIDECAR, "--opts", encoded, "--terminal", "t10"], {
-    env: {
-      ...process.env,
-      HOME: fx.home,
+    env: homeEnv(fx.home, {
       HC_LETMEKNOW_DEBOUNCE_MS: "120",
       HC_LETMEKNOW_RETRY_MS: "10000", // Long safety timer so status-change retry is proven!
-    },
+    }),
     stdio: ["ignore", "ignore", "pipe", "ipc"],
   });
   spawnedChildren.push(sidecar);
@@ -678,7 +704,9 @@ test("sidecar boot gate (OSC 7501), inline vs inbox spill, blocked retry, reconn
   assert.match(spill1, /^\[lmk\] 1 event \(\d+ B\) saved to .*000001\.jsonl — read and handle$/);
   const inboxDir = join(fx.home, ".local", "state", "hc-letmeknow", "inbox", "fffffffffffffff1");
   const inbox1 = join(inboxDir, "000001.jsonl");
-  assert.equal((await stat(inbox1)).mode & 0o777, 0o600);
+  if (!IS_WIN) {
+    assert.equal((await stat(inbox1)).mode & 0o777, 0o600);
+  }
   assert.ok((await readFile(inbox1, "utf8")).includes("X".repeat(250)));
 
   // Events 4 & 5: two events coalesced within debounce window -> spills to 000002.jsonl
@@ -728,12 +756,10 @@ test("sidecar --deliver idle uses --if idle, retries on status_mismatch (exit 10
   });
 
   const sidecar = spawn(process.execPath, [SIDECAR, "--opts", encoded, "--terminal", "t20"], {
-    env: {
-      ...process.env,
-      HOME: fx.home,
+    env: homeEnv(fx.home, {
       HC_LETMEKNOW_DEBOUNCE_MS: "80",
       HC_LETMEKNOW_RETRY_MS: "10000",
-    },
+    }),
     stdio: ["ignore", "ignore", "pipe", "ipc"],
   });
   spawnedChildren.push(sidecar);
@@ -798,12 +824,10 @@ test("sidecar shuts down on hc send exit 3 (not_found) / exit 11 (finished), reu
   });
 
   const sidecar = spawn(process.execPath, [SIDECAR, "--opts", encoded, "--terminal", "t55"], {
-    env: {
-      ...process.env,
-      HOME: fx.home,
+    env: homeEnv(fx.home, {
       HC_LETMEKNOW_DEBOUNCE_MS: "60",
       HC_LETMEKNOW_RETRY_MS: "120",
-    },
+    }),
     stdio: ["ignore", "ignore", "pipe", "ipc"],
   });
   spawnedChildren.push(sidecar);
@@ -832,10 +856,10 @@ test("sidecar shuts down on hc send exit 3 (not_found) / exit 11 (finished), reu
     hc: fx.fakeHcPath,
     letmeknowBin: fx.fakeLmkPath,
   });
-  const execRes = await runCmd(
+  const execRes = await runNodeScript(
     HC_LMK,
     ["_exec", execEncoded, "--", process.execPath, "-e", "process.stdout.write(process.env.LETMEKNOW_SESSION || ''); process.exit(9)"],
-    { env: { ...process.env, HOME: fx.home, HC_TERMINAL_ID: "t56" } }
+    { env: homeEnv(fx.home, { HC_TERMINAL_ID: "t56" }) }
   );
   assert.equal(execRes.code, 9, execRes.stderr);
   assert.equal(execRes.stdout, "fffffffffffffff2");
@@ -850,9 +874,13 @@ test("sidecar shuts down on hc send exit 3 (not_found) / exit 11 (finished), reu
     hc: fx.fakeHcPath,
     letmeknowBin: join(fx.work, "does-not-exist-lmk"),
   });
-  const failRes = await runCmd(HC_LMK_EXEC, [badEncoded, "--", "true"], {
-    env: { ...process.env, HOME: fx.home, HC_TERMINAL_ID: "t57" },
-  });
+  const failRes = IS_WIN
+    ? await runNodeScript(HC_LMK, ["_exec", badEncoded, "--", process.execPath, "-e", ""], {
+        env: homeEnv(fx.home, { HC_TERMINAL_ID: "t57" }),
+      })
+    : await runCmd(HC_LMK_EXEC, [badEncoded, "--", "true"], {
+        env: homeEnv(fx.home, { HC_TERMINAL_ID: "t57" }),
+      });
   assert.notEqual(failRes.code, 0);
   const badReceipt = JSON.parse(await readFile(badReady, "utf8"));
   assert.ok(typeof badReceipt.error === "string" && badReceipt.error.length > 0);
@@ -878,13 +906,11 @@ test("sidecar --deliver idle defers during working, delivers on confirmed done w
     prefix: "-hello",
   });
 
-  const sidecar = spawn(process.execPath, [SIDECAR, "--opts", encoded, "--terminal", "t60"], {
-    env: {
-      ...process.env,
-      HOME: fx.home,
+  const sidecar = spawn(process.execPath, [SIDECAR, "--opts", encoded, "--terminal", "t60", "--keep-ipc"], {
+    env: homeEnv(fx.home, {
       HC_LETMEKNOW_DEBOUNCE_MS: "60",
       HC_LETMEKNOW_RETRY_MS: "10000",
-    },
+    }),
     stdio: ["ignore", "ignore", "pipe", "ipc"],
   });
   spawnedChildren.push(sidecar);
@@ -933,7 +959,7 @@ test("sidecar --deliver idle defers during working, delivers on confirmed done w
   assert.deepEqual(sends[1].args.slice(0, 6), ["send", "--json", "--if", "idle", "--", "t60"]);
   assert.deepEqual(sends[2].args.slice(0, 4), ["send", "--json", "--", "t60"]);
 
-  sidecar.kill("SIGTERM");
+  sidecar.send({ type: "shutdown" });
   await new Promise(resolve => sidecar.once("exit", resolve));
 });
 
@@ -953,8 +979,8 @@ test("sidecar start priority: --session -> --key -> attach -> fresh listen with 
     hc: fx.fakeHcPath,
     letmeknowBin: fx.fakeLmkPath,
   });
-  const s1 = spawn(process.execPath, [SIDECAR, "--opts", enc1, "--terminal", "t31"], {
-    env: { ...process.env, HOME: fx.home },
+  const s1 = spawn(process.execPath, [SIDECAR, "--opts", enc1, "--terminal", "t31", "--keep-ipc"], {
+    env: homeEnv(fx.home),
     stdio: ["ignore", "ignore", "pipe", "ipc"],
   });
   spawnedChildren.push(s1);
@@ -963,7 +989,7 @@ test("sidecar start priority: --session -> --key -> attach -> fresh listen with 
   assert.equal(m1.fp, "fffffffffffffff1");
   const r1Data = await waitFor(async () => existsSync(ready1) && JSON.parse(await readFile(ready1, "utf8")));
   assert.equal(r1Data.warnings.some(w => w.includes("not attached to deadattach000001")), true);
-  s1.kill("SIGTERM");
+  s1.send({ type: "shutdown" });
   await new Promise(resolve => s1.once("exit", resolve));
 
   // 2. Second run with same --key myconv -> resumes fffffffffffffff1!
@@ -978,15 +1004,15 @@ test("sidecar start priority: --session -> --key -> attach -> fresh listen with 
     hc: fx.fakeHcPath,
     letmeknowBin: fx.fakeLmkPath,
   });
-  const s2 = spawn(process.execPath, [SIDECAR, "--opts", enc2, "--terminal", "t32"], {
-    env: { ...process.env, HOME: fx.home },
+  const s2 = spawn(process.execPath, [SIDECAR, "--opts", enc2, "--terminal", "t32", "--keep-ipc"], {
+    env: homeEnv(fx.home),
     stdio: ["ignore", "ignore", "pipe", "ipc"],
   });
   spawnedChildren.push(s2);
   const m2 = await new Promise(resolve => s2.once("message", resolve));
   assert.equal(m2.ok, true);
   assert.equal(m2.fp, "fffffffffffffff1");
-  s2.kill("SIGTERM");
+  s2.send({ type: "shutdown" });
   await new Promise(resolve => s2.once("exit", resolve));
 
   // 3. Explicit --session failing falls back to working --attach!
@@ -1002,8 +1028,8 @@ test("sidecar start priority: --session -> --key -> attach -> fresh listen with 
     hc: fx.fakeHcPath,
     letmeknowBin: fx.fakeLmkPath,
   });
-  const s3 = spawn(process.execPath, [SIDECAR, "--opts", enc3, "--terminal", "t33"], {
-    env: { ...process.env, HOME: fx.home },
+  const s3 = spawn(process.execPath, [SIDECAR, "--opts", enc3, "--terminal", "t33", "--keep-ipc"], {
+    env: homeEnv(fx.home),
     stdio: ["ignore", "ignore", "pipe", "ipc"],
   });
   spawnedChildren.push(s3);
@@ -1012,6 +1038,149 @@ test("sidecar start priority: --session -> --key -> attach -> fresh listen with 
   assert.equal(m3.fp, "liveattach000001");
   const r3Data = await waitFor(async () => existsSync(ready3) && JSON.parse(await readFile(ready3, "utf8")));
   assert.equal(r3Data.warnings.some(w => w.includes("not missing000000001 again")), true);
-  s3.kill("SIGTERM");
+  s3.send({ type: "shutdown" });
   await new Promise(resolve => s3.once("exit", resolve));
+});
+
+test("hc-lmk _exec (Windows/remote inner path) boots concurrently with slow join, runs lmk CLI, and shuts down sidecar gracefully via IPC", async () => {
+  const fx = await createFakeEnv("win-exec-ipc");
+  await fx.setLmkControl({ joinDelayMs: 600 });
+
+  const readyFile = join(fx.work, "ready.json");
+  const reportFile = join(fx.work, "child-report.json");
+  const releaseFile = join(fx.work, "release.flag");
+  const encoded = encodeExecOpts({
+    joinSpecified: true,
+    join: ["grp_alpha"],
+    attachSpecified: true,
+    attach: "",
+    readyFile,
+    hc: fx.fakeHcPath,
+    letmeknowBin: fx.fakeLmkPath,
+    intro: "win intro",
+    bootFallbackMs: 200,
+  });
+
+  const targetScript = join(fx.work, "win-target.mjs");
+  await writeFile(
+    targetScript,
+    `
+    import { existsSync, writeFileSync } from "node:fs";
+    writeFileSync(${JSON.stringify(reportFile)}, JSON.stringify({
+      readyExistsAtBoot: existsSync(${JSON.stringify(readyFile)}),
+      env: {
+        LETMEKNOW_SESSION: process.env.LETMEKNOW_SESSION,
+        LETMEKNOW_BIN: process.env.LETMEKNOW_BIN,
+        LETMEKNOW_LOG: process.env.LETMEKNOW_LOG,
+        AGY_LETMEKNOW_DISABLE: process.env.AGY_LETMEKNOW_DISABLE,
+        PI_LETMEKNOW_DISABLE: process.env.PI_LETMEKNOW_DISABLE,
+        CLAUDE_LETMEKNOW_DISABLE: process.env.CLAUDE_LETMEKNOW_DISABLE,
+        AGY_CLI_OSC7501: process.env.AGY_CLI_OSC7501,
+      },
+    }));
+    while (!existsSync(${JSON.stringify(releaseFile)})) {
+      await new Promise(r => setTimeout(r, 30));
+    }
+    process.exit(19);
+    `
+  );
+
+  const proc = spawn(process.execPath, [HC_LMK, "_exec", encoded, "--", process.execPath, targetScript], {
+    env: homeEnv(fx.home, {
+      HC_TERMINAL_ID: "t71",
+      LETMEKNOW_SESSION: "outer-leak",
+      HC_LETMEKNOW_POLL_MS: "60000", // Long poll so ONLY IPC shutdown triggers immediate cleanup!
+    }),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  spawnedChildren.push(proc);
+  let stderr = "";
+  proc.stderr.on("data", c => (stderr += c));
+
+  const report = await waitFor(
+    async () => existsSync(reportFile) && JSON.parse(await readFile(reportFile, "utf8")),
+    5000,
+    "win-exec target boot"
+  );
+  assert.equal(report.readyExistsAtBoot, false, "_exec must boot child before slow sibling join finishes");
+  assert.equal(report.env.LETMEKNOW_SESSION, "fffffffffffffff1");
+  assert.equal(report.env.LETMEKNOW_BIN, fx.fakeLmkPath);
+  assert.equal(report.env.AGY_LETMEKNOW_DISABLE, "1");
+  assert.equal(report.env.PI_LETMEKNOW_DISABLE, "1");
+  assert.equal(report.env.CLAUDE_LETMEKNOW_DISABLE, "1");
+  assert.equal(report.env.AGY_CLI_OSC7501, "on");
+
+  const ready = await waitFor(
+    async () => existsSync(readyFile) && JSON.parse(await readFile(readyFile, "utf8")),
+    5000,
+    "win-exec ready file"
+  );
+  assert.equal(ready.fp, "fffffffffffffff1");
+  assert.deepEqual(ready.groups, ["grp_alpha"]);
+
+  const termFile = join(fx.home, ".local", "state", "hc-letmeknow", "term-t71.json");
+  const termState = JSON.parse(await readFile(termFile, "utf8"));
+  assert.equal(isAlive(termState.sidecarPid), true);
+
+  // Verify lmk CLI works with state fallback via node invocation (as lmk.cmd does on Windows)
+  const lmkRes = await runNodeScript(LMK_BIN, ["echo", "win-cli"], {
+    env: {
+      PATH: process.env.PATH,
+      HOME: fx.home,
+      USERPROFILE: fx.home,
+      HC_TERMINAL_ID: "t71",
+    },
+    input: "hello-win",
+  });
+  assert.equal(lmkRes.code, 0, lmkRes.stderr);
+  assert.deepEqual(JSON.parse(lmkRes.stdout), {
+    session: "fffffffffffffff1",
+    rest: ["echo", "win-cli"],
+    stdin: "hello-win",
+    hadLmkSession: false,
+  });
+
+  // Release child -> hc-lmk _exec sends IPC shutdown -> sidecar exits cleanly well under 60s poll interval
+  const exitPromise = new Promise(resolve => proc.once("exit", code => resolve(code)));
+  await writeFile(releaseFile, "go");
+  const code = await exitPromise;
+  assert.equal(code, 19, stderr);
+
+  assert.equal(existsSync(termFile), false, "sidecar must delete term state file before _exec exits");
+  assert.equal(isAlive(termState.sidecarPid), false, "sidecar must exit via IPC shutdown");
+  if (!IS_WIN) {
+    const finalLmkCalls = await fx.readLmkCalls();
+    assert.ok(finalLmkCalls.some(c => c.stopped === "fffffffffffffff1"));
+  }
+});
+
+test("sidecar --keep-ipc shuts down cleanly on IPC disconnect (simulating abrupt Windows parent exit)", async () => {
+  const fx = await createFakeEnv("ipc-disconnect");
+  const encoded = encodeExecOpts({
+    joinSpecified: true,
+    join: [],
+    attachSpecified: true,
+    attach: "",
+    hc: fx.fakeHcPath,
+    letmeknowBin: fx.fakeLmkPath,
+  });
+  const sidecar = spawn(process.execPath, [SIDECAR, "--opts", encoded, "--terminal", "t72", "--keep-ipc"], {
+    env: homeEnv(fx.home, { HC_LETMEKNOW_POLL_MS: "60000" }),
+    stdio: ["ignore", "ignore", "pipe", "ipc"],
+  });
+  spawnedChildren.push(sidecar);
+  const ready = await new Promise((resolve, reject) => {
+    sidecar.once("message", resolve);
+    sidecar.once("error", reject);
+  });
+  assert.equal(ready.ok, true);
+  assert.equal(sidecar.connected, true, "--keep-ipc must keep IPC channel open after ready");
+
+  const termFile = join(fx.home, ".local", "state", "hc-letmeknow", "term-t72.json");
+  assert.equal(existsSync(termFile), true);
+
+  const exitPromise = new Promise(resolve => sidecar.once("exit", code => resolve(code)));
+  sidecar.disconnect();
+  assert.equal(await exitPromise, 0);
+  assert.equal(existsSync(termFile), false);
 });

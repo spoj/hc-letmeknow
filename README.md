@@ -8,7 +8,9 @@ Works with any CLI agent or shell (`agy`, `pi`, `codex`, `claude`, `bash`, etc.)
 
 Requires Node.js >= 20 and `hc` (`herdr-core`) on your `PATH` (or configured via `--hc`).
 
-1. Clone the repository and symlink `bin/hc-lmk` and `bin/lmk` onto your `PATH`:
+1. Clone the repository and put `bin/hc-lmk` and `bin/lmk` onto your `PATH`:
+
+On Linux / macOS:
 
 ```sh
 git clone https://github.com/spoj/hc-letmeknow.git
@@ -16,6 +18,15 @@ cd hc-letmeknow
 mkdir -p ~/.local/bin
 ln -s "$PWD/bin/hc-lmk" ~/.local/bin/hc-lmk
 ln -s "$PWD/bin/lmk" ~/.local/bin/lmk
+```
+
+On Windows (PowerShell, with `%USERPROFILE%\.local\bin` on `PATH`):
+
+```powershell
+git clone https://github.com/spoj/hc-letmeknow.git "$HOME\src\hc-letmeknow"
+New-Item -ItemType Directory -Force "$HOME\.local\bin" | Out-Null
+"@echo off`r`nnode `"$HOME\src\hc-letmeknow\bin\hc-lmk`" %*" | Set-Content -NoNewline "$HOME\.local\bin\hc-lmk.cmd"
+"@echo off`r`nnode `"$HOME\src\hc-letmeknow\bin\lmk`" %*" | Set-Content -NoNewline "$HOME\.local\bin\lmk.cmd"
 ```
 
 Alternatively, run `npm link` from the repository directory.
@@ -62,8 +73,8 @@ hc-lmk --bg --json --name worker --join <group> -- agy --dangerously-skip-permis
 - `--bg`, `--new`, `--json`, `--name <name>`, `--cwd <dir>`, `--on <machine>`, `--label <k=v>` (repeatable), `--no-parent`, `--outlive-parent`, `--no-notify`, `--keep`, `--rm`
 
 **Launch modes:**
-- Outside `hc` (no `$HC_TERMINAL_ID`) or when any new-terminal flag is set: launches `hc run --bg --json ... -- <hc-lmk-exec> <encoded-opts> -- <cmd> [args...]` (or `hc-lmk _exec` via remote `PATH` when `--on` is set). Prints JSON (with `--json`) or address when `--bg`/non-TTY, or runs `hc attach <address>` when interactive TTY without `--bg`.
-- Already inside `hc` (`$HC_TERMINAL_ID` set) with no new-terminal flags: wraps in-place in the current terminal, exporting session env vars to `<cmd>`, stopping the sidecar cleanly on exit, and mirroring `<cmd>`'s exit code.
+- Outside `hc` (no `$HC_TERMINAL_ID`) or when any new-terminal flag is set: launches `hc run --bg --json ... -- <inner-exec> <encoded-opts> -- <cmd> [args...]`, where `<inner-exec>` is `bin/hc-lmk-exec` on Unix, `node bin/hc-lmk _exec` on Windows, and `hc-lmk _exec` via remote `PATH` when `--on` is set. Prints JSON (with `--json`) or address when `--bg`/non-TTY, or runs `hc attach <address>` when interactive TTY without `--bg`.
+- Already inside `hc` (`$HC_TERMINAL_ID` set) with no new-terminal flags: wraps in-place in the current terminal, exporting session env vars to `<cmd>`, stopping the sidecar cleanly via IPC on exit, and mirroring `<cmd>`'s exit code.
 
 ### Inside agent CLI: `lmk`
 
@@ -74,7 +85,9 @@ Inside an `hc-lmk` terminal, run `lmk <args...>` to execute commands against the
 
 ## Architecture
 
-1. **`bin/hc-lmk-exec`** (POSIX `sh`): runs `node src/prepare.mjs` to spawn detached `src/sidecar.mjs`, waits only for `letmeknow` `ready` (so the harness boots concurrently with slow sibling group joins), sources & deletes a `0600` temp env file exporting `LETMEKNOW_SESSION`, `LETMEKNOW_BIN`, `LETMEKNOW_LOG`, `AGY_LETMEKNOW_DISABLE=1`, `PI_LETMEKNOW_DISABLE=1`, `CLAUDE_LETMEKNOW_DISABLE=1`, and `AGY_CLI_OSC7501=on`, then calls POSIX `exec "$@"` so the harness owns the PTY directly.
+1. **Inner PTY entrypoint**:
+   - On Unix, **`bin/hc-lmk-exec`** (POSIX `sh`) runs `node src/prepare.mjs` to spawn detached `src/sidecar.mjs`, waits only for `letmeknow` `ready` (so the harness boots concurrently with slow sibling group joins), sources & deletes a `0600` temp env file exporting `LETMEKNOW_SESSION`, `LETMEKNOW_BIN`, `LETMEKNOW_LOG`, `AGY_LETMEKNOW_DISABLE=1`, `PI_LETMEKNOW_DISABLE=1`, `CLAUDE_LETMEKNOW_DISABLE=1`, and `AGY_CLI_OSC7501=on`, then calls POSIX `exec "$@"` so the harness owns the PTY directly.
+   - On Windows (and remote `--on` / in-place wrapping), **`node bin/hc-lmk _exec`** starts `src/sidecar.mjs` with a kept IPC channel (`windowsHide: true`), spawns `<cmd>` directly with `stdio: "inherit"` and `windowsHide: false` (resolving `.exe` directly and `.cmd`/`.bat` shims like `pi.cmd`/`codex.cmd` via properly escaped `cmd.exe /d /s /c`), mirrors its exit code, and gracefully shuts down the sidecar over IPC on child exit (or parent disconnect).
 2. **`src/sidecar.mjs`**:
    - Downloads & SHA-512 verifies the latest `0.26.x` `@letmeknow/<platform>-<arch>` into `~/.cache/hc-letmeknow/`, falling back offline to `~/.cache/{hc,agy,pi}-letmeknow`.
    - Starts session with priority `--session` / `--key` -> `attach` -> fresh `listen`.

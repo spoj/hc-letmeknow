@@ -1,10 +1,7 @@
-import { execFile, spawn } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { mkdir, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { pathToFileURL } from "node:url";
-import { promisify } from "node:util";
 import {
   DEFAULT_DEBOUNCE_MS,
   capLine,
@@ -12,11 +9,13 @@ import {
   classifyHcError,
   decodeExecOpts,
   defaultConfigPath,
+  execFileCommand,
   formatInboxPointer,
   formatInlineCandidate,
   inboxDirPath,
   installBinary,
   isAlive,
+  isMainModule,
   joinListed,
   killChildCleanly,
   lmkJson,
@@ -25,13 +24,13 @@ import {
   resolveSidecarConfig,
   sanitizeSingleLine,
   saveSessionFp,
+  spawnCommand,
   stateDir,
+  stripEnvVar,
   termStatePath,
   writeFileAtomic,
   writeJsonAtomic,
 } from "./core.mjs";
-
-const run = promisify(execFile);
 
 function parseSidecarArgv(argv) {
   const out = {};
@@ -41,18 +40,21 @@ function parseSidecarArgv(argv) {
     else if (a === "--terminal") out.terminalId = argv[++i];
     else if (a === "--watch-pid") out.watchPid = Number(argv[++i]);
     else if (a === "--err-log") out.errLogPath = argv[++i];
+    else if (a === "--keep-ipc") out.keepIpc = true;
   }
   return out;
 }
 
-function sendIpcOnce(payload) {
+function sendIpcOnce(payload, { keepIpc = false } = {}) {
   if (typeof process.send !== "function") return;
   try {
     process.send(payload);
   } catch {}
-  try {
-    if (process.connected) process.disconnect();
-  } catch {}
+  if (!keepIpc) {
+    try {
+      if (process.connected) process.disconnect();
+    } catch {}
+  }
 }
 
 async function initInboxSeq(fp) {
@@ -71,7 +73,7 @@ async function initInboxSeq(fp) {
   return max;
 }
 
-export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath }) {
+export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath, keepIpc = false }) {
   if (!encodedOpts || !terminalId) {
     throw new Error("sidecar requires --opts and --terminal");
   }
@@ -87,7 +89,7 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
   const retryMaxMs = Math.max(retryBaseMs, Number(process.env.HC_LETMEKNOW_RETRY_MAX_MS) || 15_000);
   const hcSendTimeoutMs = Number(process.env.HC_LETMEKNOW_SEND_TIMEOUT_MS) || 90_000;
 
-  const { LETMEKNOW_SESSION: _stripSession, ...childEnv } = process.env;
+  const childEnv = stripEnvVar(process.env, "LETMEKNOW_SESSION");
 
   const dir = stateDir();
   await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -147,7 +149,7 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
   const notifyIpc = payload => {
     if (ipcSent) return;
     ipcSent = true;
-    sendIpcOnce(payload);
+    sendIpcOnce(payload, { keepIpc: keepIpc && payload?.ok === true });
   };
 
   const cleanupOwnStateFile = () => {
@@ -188,6 +190,14 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
   process.on("SIGTERM", () => void shutdown(0));
   process.on("SIGINT", () => void shutdown(0));
   process.on("SIGHUP", () => void shutdown(0));
+  process.on("message", msg => {
+    if (msg && msg.type === "shutdown") void shutdown(0);
+  });
+  if (keepIpc) {
+    process.on("disconnect", () => {
+      if (!shuttingDown) void shutdown(0);
+    });
+  }
 
   const prepareDeliveryPayload = async (lines) => {
     const capped = capLines(lines);
@@ -245,7 +255,7 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
 
   const queryTerminal = async () => {
     try {
-      const { stdout } = await run(cfg.hcBin, ["get", "--json", terminalId], {
+      const { stdout } = await execFileCommand(cfg.hcBin, ["get", "--json", terminalId], {
         env: childEnv,
         timeout: 10_000,
         windowsHide: true,
@@ -317,7 +327,7 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
       sendArgs.push("--", terminalId, payload.text);
 
       try {
-        await run(cfg.hcBin, sendArgs, {
+        await execFileCommand(cfg.hcBin, sendArgs, {
           env: childEnv,
           timeout: hcSendTimeoutMs,
           windowsHide: true,
@@ -484,7 +494,7 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
 
   const startHcEvents = () => {
     if (shuttingDown) return;
-    const child = spawn(cfg.hcBin, ["events", "--json", "--terminal", terminalId], {
+    const child = spawnCommand(cfg.hcBin, ["events", "--json", "--terminal", terminalId], {
       stdio: ["ignore", "pipe", "pipe"],
       env: childEnv,
       windowsHide: true,
@@ -533,7 +543,7 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
 
     const tryStart = args =>
       new Promise((resolveStart, rejectStart) => {
-        const child = spawn(executable, args, {
+        const child = spawnCommand(executable, args, {
           stdio: ["ignore", "pipe", "pipe"],
           env: childEnv,
           windowsHide: true,
@@ -627,7 +637,7 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
     startHcEvents();
 
     // Best-effort hc label lmk=<fp>.
-    void run(cfg.hcBin, ["label", terminalId, `lmk=${fp}`], {
+    void execFileCommand(cfg.hcBin, ["label", terminalId, `lmk=${fp}`], {
       env: childEnv,
       timeout: 10_000,
       windowsHide: true,
@@ -680,8 +690,7 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
   }
 }
 
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
-if (isMain) {
+if (isMainModule(import.meta.url, process.argv[1])) {
   const args = parseSidecarArgv(process.argv.slice(2));
   void runSidecar(args);
 }

@@ -1,27 +1,28 @@
 #!/usr/bin/env node
-import { execFile, spawn } from "node:child_process";
-import { realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import {
   DEFAULT_HC,
   USAGE,
   buildEnvExports,
+  buildExecArgv,
   buildHcRunArgs,
   decodeExecOpts,
   defaultConfigPath,
   encodeExecOpts,
+  execFileCommand,
   extractExecOpts,
   hasNewTerminalFlags,
-  killPidCleanly,
+  isMainModule,
+  killChildCleanly,
   parseCliArgs,
   readJsonIfExists,
+  spawnCommand,
 } from "../src/core.mjs";
 import { startSidecarAndWait } from "../src/prepare.mjs";
 
-const run = promisify(execFile);
-const BIN_DIR = dirname(fileURLToPath(import.meta.url));
+const HC_LMK_PATH = fileURLToPath(import.meta.url);
+const BIN_DIR = dirname(HC_LMK_PATH);
 const HC_LMK_EXEC_PATH = join(BIN_DIR, "hc-lmk-exec");
 
 async function runWrappedInPlace({ encodedOpts, command, terminalId }) {
@@ -29,6 +30,7 @@ async function runWrappedInPlace({ encodedOpts, command, terminalId }) {
     encodedOpts,
     terminalId,
     watchPid: process.pid,
+    keepIpc: true,
   });
 
   const childEnv = { ...process.env };
@@ -37,12 +39,17 @@ async function runWrappedInPlace({ encodedOpts, command, terminalId }) {
   }
 
   const [cmd, ...args] = command;
-  const child = spawn(cmd, args, {
+  const child = spawnCommand(cmd, args, {
     stdio: "inherit",
     env: childEnv,
+    windowsHide: false,
   });
 
   const forwardSignal = sig => {
+    if (process.platform === "win32") {
+      void killChildCleanly(child, 1000);
+      return;
+    }
     try { child.kill(sig); } catch {}
   };
   const onSigint = () => {};
@@ -61,13 +68,13 @@ async function runWrappedInPlace({ encodedOpts, command, terminalId }) {
   process.off("SIGTERM", onSigterm);
   process.off("SIGHUP", onSighup);
 
-  await killPidCleanly(ready.sidecarPid, 2500);
+  await ready.stop(2500);
 
   if (outcome.error) {
     console.error(`hc-lmk: failed to run ${cmd}: ${outcome.error.message}`);
     process.exit(127);
   }
-  if (outcome.signal) {
+  if (outcome.signal && process.platform !== "win32") {
     process.kill(process.pid, outcome.signal);
     return;
   }
@@ -106,14 +113,20 @@ async function runOuterLaunch(parsed) {
   const hcBin = parsed.hc ?? fileConfig.hc ?? DEFAULT_HC;
   const execOpts = extractExecOpts(parsed, { isRemote });
   const encodedOpts = encodeExecOpts(execOpts);
-  const execArgv = isRemote
-    ? ["hc-lmk", "_exec", encodedOpts, "--", ...parsed.command]
-    : [HC_LMK_EXEC_PATH, encodedOpts, "--", ...parsed.command];
+  const execArgv = buildExecArgv({
+    isRemote,
+    platform: process.platform,
+    nodePath: process.execPath,
+    hcLmkPath: HC_LMK_PATH,
+    hcLmkExecPath: HC_LMK_EXEC_PATH,
+    encodedOpts,
+    command: parsed.command,
+  });
   const hcArgs = buildHcRunArgs(parsed, execArgv);
 
   let stdout;
   try {
-    ({ stdout } = await run(hcBin, hcArgs, { windowsHide: true }));
+    ({ stdout } = await execFileCommand(hcBin, hcArgs, { windowsHide: true }));
   } catch (err) {
     if (err.stderr) process.stderr.write(err.stderr);
     else if (err.stdout) process.stderr.write(err.stdout);
@@ -147,7 +160,10 @@ async function runOuterLaunch(parsed) {
 
   const onSigint = () => {};
   process.on("SIGINT", onSigint);
-  const attach = spawn(hcBin, ["attach", address], { stdio: "inherit" });
+  const attach = spawnCommand(hcBin, ["attach", address], {
+    stdio: "inherit",
+    windowsHide: false,
+  });
   attach.on("error", err => {
     process.off("SIGINT", onSigint);
     console.error(`hc-lmk: failed to attach: ${err.message}`);
@@ -155,8 +171,11 @@ async function runOuterLaunch(parsed) {
   });
   attach.on("exit", (code, signal) => {
     process.off("SIGINT", onSigint);
-    if (signal) process.kill(process.pid, signal);
-    process.exit(code ?? 0);
+    if (signal && process.platform !== "win32") {
+      process.kill(process.pid, signal);
+      return;
+    }
+    process.exit(code ?? (signal ? 1 : 0));
   });
 }
 
@@ -202,8 +221,7 @@ async function main() {
   }
 }
 
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
-if (isMain) {
+if (isMainModule(import.meta.url, process.argv[1])) {
   try {
     await main();
   } catch (err) {
