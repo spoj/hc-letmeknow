@@ -279,12 +279,14 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
   const attemptDelivery = async () => {
     if (shuttingDown || delivering || !bootReady || pendingLines.length === 0) return;
     delivering = true;
+    const attemptEpoch = statusEpoch;
     clearRetryTimer();
     const deferRetry = () => {
       retryAttempts += 1;
       const delay = Math.min(retryMaxMs, retryBaseMs * Math.min(retryAttempts, 3));
       scheduleRetry(delay);
     };
+    const isDeliverableNow = () => (cfg.deliver === "idle" ? isIdleReady(terminalStatus) : terminalStatus !== "blocked");
     try {
       let useIfIdle = cfg.deliver === "idle";
       if (cfg.deliver === "idle") {
@@ -355,6 +357,10 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
             // Re-enter immediately in finally with confirmed "done" status (omitting --if idle).
             return;
           }
+        }
+        if (statusEpoch !== attemptEpoch && isDeliverableNow()) {
+          // A fresh status transition arrived while hc send / hc get was in flight; retry immediately in finally.
+          return;
         }
         deferRetry();
       }
@@ -484,6 +490,7 @@ export async function runSidecar({ encodedOpts, terminalId, watchPid, errLogPath
         return;
       }
       if (type === "restarted") {
+        statusEpoch += 1;
         if (bootReady && pendingLines.length > 0 && !delivering && cfg.deliver === "always") {
           clearRetryTimer();
           void attemptDelivery();
