@@ -1,9 +1,14 @@
 {
   "name": "hc-letmeknow",
   "version": "0.1.0",
-  "description": "Harness-agnostic letmeknow wrapper for herdr-core (hc)",
+  "description": "Harness-agnostic letmeknow wrapper for hc (herdr-core)",
   "type": "module",
   "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/spoj/hc-letmeknow.git"
+  },
   "engines": {
     "node": ">=20"
   },

@@ -6,12 +6,19 @@ Works with any CLI agent or shell (`agy`, `pi`, `codex`, `claude`, `bash`, etc.)
 
 ## Install
 
-1. Symlink `bin/hc-lmk` and `bin/lmk` onto your `PATH`:
+Requires Node.js >= 20 and `hc` (`herdr-core`) on your `PATH` (or configured via `--hc`).
+
+1. Clone the repository and symlink `bin/hc-lmk` and `bin/lmk` onto your `PATH`:
 
 ```sh
+git clone https://github.com/spoj/hc-letmeknow.git
+cd hc-letmeknow
+mkdir -p ~/.local/bin
 ln -s "$PWD/bin/hc-lmk" ~/.local/bin/hc-lmk
 ln -s "$PWD/bin/lmk" ~/.local/bin/lmk
 ```
+
+Alternatively, run `npm link` from the repository directory.
 
 2. Optionally configure default groups or attach fingerprint in `~/.config/hc-letmeknow/config.json`:
 
@@ -38,7 +45,7 @@ hc-lmk --bg --json --name worker --join <group> -- agy --dangerously-skip-permis
 
 **`letmeknow` options:**
 - `--join <g1,g2>`: repeatable/comma-separated group IDs (`""` or `--no-join` disables joining)
-- `--attach <fp>`: attach to an existing detached session (`""` disables attach)
+- `--attach <fp>`: attach to an existing detached session (`""` or `--no-attach` disables attach)
 - `--session <fp>`: resume a saved session fingerprint
 - `--key <name>`: persist and resume session fingerprint in `~/.local/state/hc-letmeknow/sessions.json`
 - `--ready-file <path>`: atomic JSON `{ fp, groups, warnings }` or `{ error }` written after group join
@@ -82,3 +89,7 @@ Inside an `hc-lmk` terminal, run `lmk <args...>` to execute commands against the
 ```sh
 node --test test/*.test.mjs
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
