@@ -85,6 +85,7 @@ async function createFakeEnv(name) {
     attachFails: true,
     sessionFailFps: [],
     crashAfterMs: 0,
+    crashNow: false,
   }));
 
   const fakeHcScript = join(work, IS_WIN ? "fake-hc.mjs" : "fake-hc");
@@ -291,6 +292,12 @@ if (cmd === "listen") {
   process.stdout.write(JSON.stringify({ type: "ready", fp, bin: ${JSON.stringify(fakeLmkPath)}, log: logFile }) + "\\n");
   let offset = 0;
   const iv = setInterval(() => {
+    const curCtl = loadCtl();
+    if (curCtl.crashNow) {
+      clearInterval(iv);
+      process.stderr.write("simulated crash\\n");
+      process.exit(2);
+    }
     if (!existsSync(eventsFile)) return;
     const raw = readFileSync(eventsFile, "utf8");
     if (raw.length <= offset) return;
@@ -628,13 +635,16 @@ test("sidecar boot gate (OSC 7501), inline vs inbox spill, blocked retry, reconn
     sendResponses: [{ code: 9, kind: "blocked", message: "permission prompt" }, "ok", "ok", "ok", "ok"],
   });
 
+  const inlineBytes = Buffer.byteLength(join(fx.work, "lmk-session.log"), "utf8") + 160;
+  const largePayload = "X".repeat(inlineBytes);
+
   const encoded = encodeExecOpts({
     joinSpecified: true,
     join: [],
     attachSpecified: true,
     attach: "",
     deliver: "always",
-    inlineBytes: 180,
+    inlineBytes,
     bootFallbackMs: 60_000, // Long fallback so ONLY OSC 7501 opens boot gate
     hc: fx.fakeHcPath,
     letmeknowBin: fx.fakeLmkPath,
@@ -696,9 +706,9 @@ test("sidecar boot gate (OSC 7501), inline vs inbox spill, blocked retry, reconn
   assert.ok(secondDelivered.startsWith("[lmk] {"));
   assert.equal(secondDelivered.includes("session="), false);
 
-  // Event 3: single event exceeding inlineBytes (180) -> spills to inbox/fp/000001.jsonl (0600)
-  await fx.emitLmkEvent({ type: "message", from: "carol", content: "X".repeat(250) });
-  await waitFor(async () => (await fx.readHcCalls()).filter(c => c.args[0] === "send").length >= 4, 4000, "large spill send");
+  // Event 3: single event exceeding inlineBytes -> spills to inbox/fp/000001.jsonl (0600)
+  await fx.emitLmkEvent({ type: "message", from: "carol", content: largePayload });
+  await waitFor(async () => (await fx.readHcCalls()).filter(c => c.args[0] === "send").length >= 4, 8000, "large spill send");
   sends = (await fx.readHcCalls()).filter(c => c.args[0] === "send");
   const spill1 = sends[3].args.at(-1);
   assert.match(spill1, /^\[lmk\] 1 event \(\d+ B\) saved to .*000001\.jsonl — read and handle$/);
@@ -707,7 +717,7 @@ test("sidecar boot gate (OSC 7501), inline vs inbox spill, blocked retry, reconn
   if (!IS_WIN) {
     assert.equal((await stat(inbox1)).mode & 0o777, 0o600);
   }
-  assert.ok((await readFile(inbox1, "utf8")).includes("X".repeat(250)));
+  assert.ok((await readFile(inbox1, "utf8")).includes(largePayload));
 
   // Events 4 & 5: two events coalesced within debounce window -> spills to 000002.jsonl
   await fx.emitLmkEvent({ type: "message", from: "d1", content: "m1" });
@@ -742,7 +752,6 @@ test("sidecar --deliver idle uses --if idle, retries on status_mismatch (exit 10
       "ok",
     ],
   });
-  await fx.setLmkControl({ crashAfterMs: 700 });
 
   const encoded = encodeExecOpts({
     joinSpecified: true,
@@ -781,10 +790,11 @@ test("sidecar --deliver idle uses --if idle, retries on status_mismatch (exit 10
     method: "event",
     params: { terminal: "t20", type: "status", data: { status: { state: "idle" } } },
   });
-  await waitFor(async () => (await fx.readHcCalls()).filter(c => c.args[0] === "send").length >= 2, 4000, "idle retry send");
+  await waitFor(async () => (await fx.readHcCalls()).filter(c => c.args[0] === "send").length >= 2, 8000, "idle retry send");
 
-  // Fake letmeknow crashes at ~700ms -> sidecar queues crash notice to terminal!
-  await waitFor(async () => (await fx.readHcCalls()).filter(c => c.args[0] === "send").length >= 3, 4000, "crash notice send");
+  // Trigger simulated letmeknow crash deterministically after retry send -> sidecar queues crash notice to terminal!
+  await fx.setLmkControl({ crashNow: true });
+  await waitFor(async () => (await fx.readHcCalls()).filter(c => c.args[0] === "send").length >= 3, 8000, "crash notice send");
   sends = (await fx.readHcCalls()).filter(c => c.args[0] === "send");
   assert.match(sends[2].args.at(-1), /letmeknow stopped \(exit 2\): simulated crash/);
 
